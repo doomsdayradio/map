@@ -1,0 +1,137 @@
+name: Publish to Bunny S3
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "site/**"
+      - ".github/workflows/publish-bunny-s3.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Artifact group to publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - website
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-bunny-s3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  notify-start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Notify workflow start
+        continue-on-error: true
+        shell: bash
+        env:
+          NTFY_DOOMSDAY_BUILDS: ${{ secrets.NTFY_DOOMSDAY_BUILDS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NTFY_DOOMSDAY_BUILDS:-}" ]; then
+            echo "NTFY_DOOMSDAY_BUILDS fehlt; Build-Benachrichtigung übersprungen."
+            exit 0
+          fi
+          repo="${GITHUB_REPOSITORY#*/}"
+          timestamp="$(TZ=Europe/Berlin date '+%Y-%m-%d %H:%M:%S %Z')"
+          message="${repo} | ${timestamp} | START | ${GITHUB_WORKFLOW} | Event: ${GITHUB_EVENT_NAME} | Branch: ${GITHUB_REF_NAME} | Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail --silent --show-error --output /dev/null \
+            --connect-timeout 5 --max-time 20 \
+            -H "Authorization: Bearer ${NTFY_DOOMSDAY_BUILDS}" \
+            -H "Title: ${repo} | START | ${GITHUB_WORKFLOW}" \
+            --data-binary "$message" \
+            https://ntfy.bot.omg.lol/doomsday-github-action
+
+  website:
+    needs: notify-start
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'website'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate website artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f site/index.html
+          test -f site/map.css
+          test -f site/map.js
+          test -f site/map.txt
+          test -f site/layout.json
+          python -m json.tool site/layout.json >/dev/null
+
+      - name: Publish website to map prefix
+        shell: bash
+        env:
+          BUNNY_ENDPOINT_URL: ${{ secrets.WEBSITE_S3_ENDPOINT_URL }}
+          BUNNY_PASSWORD: ${{ secrets.WEBSITE_S3_PW }}
+          BUNNY_ZONE_ID: ${{ secrets.WEBSITE_S3_ZONE_ID }}
+          BUNNY_ZONE_NAME: ${{ secrets.WEBSITE_S3_ZONE_NAME }}
+        run: |
+          set -euo pipefail
+          : "${BUNNY_ENDPOINT_URL:?WEBSITE_S3_ENDPOINT_URL is required}"
+          : "${BUNNY_PASSWORD:?WEBSITE_S3_PW is required}"
+          : "${BUNNY_ZONE_ID:?WEBSITE_S3_ZONE_ID is required}"
+          : "${BUNNY_ZONE_NAME:?WEBSITE_S3_ZONE_NAME is required}"
+
+          endpoint="${BUNNY_ENDPOINT_URL%/}"
+          if [[ ! "$endpoint" =~ ^https://([a-z]+)-s3\.storage\.bunnycdn\.com$ ]]; then
+            echo "WEBSITE_S3_ENDPOINT_URL is not a supported Bunny S3 endpoint." >&2
+            exit 1
+          fi
+          region="${BASH_REMATCH[1]}"
+
+          export AWS_ACCESS_KEY_ID="$BUNNY_ZONE_NAME"
+          export AWS_SECRET_ACCESS_KEY="$BUNNY_PASSWORD"
+          export AWS_DEFAULT_REGION="$region"
+          export AWS_REGION="$region"
+          export AWS_EC2_METADATA_DISABLED=true
+
+          aws s3 sync site/ \
+            "s3://${BUNNY_ZONE_NAME}/map/" \
+            --endpoint-url "$endpoint" \
+            --no-progress \
+            --only-show-errors
+
+  notify-finish:
+    if: ${{ always() }}
+    needs:
+      - notify-start
+      - website
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Notify workflow result
+        continue-on-error: true
+        shell: bash
+        env:
+          NTFY_DOOMSDAY_BUILDS: ${{ secrets.NTFY_DOOMSDAY_BUILDS }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NTFY_DOOMSDAY_BUILDS:-}" ]; then
+            echo "NTFY_DOOMSDAY_BUILDS fehlt; Build-Benachrichtigung übersprungen."
+            exit 0
+          fi
+          repo="${GITHUB_REPOSITORY#*/}"
+          timestamp="$(TZ=Europe/Berlin date '+%Y-%m-%d %H:%M:%S %Z')"
+          result="$(jq -r '[to_entries[] | select(.key != "notify-start") | .value.result] | if index("failure") then "failure" elif index("cancelled") then "cancelled" elif index("success") then "success" else "skipped" end' <<< "$NEEDS_JSON")"
+          details="$(jq -r '[to_entries[] | select(.key != "notify-start") | "\(.key): \(.value.result)"] | join(", ")' <<< "$NEEDS_JSON")"
+          message="${repo} | ${timestamp} | ENDE: ${result} | ${GITHUB_WORKFLOW} | Jobs: ${details} | Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail --silent --show-error --output /dev/null \
+            --connect-timeout 5 --max-time 20 \
+            -H "Authorization: Bearer ${NTFY_DOOMSDAY_BUILDS}" \
+            -H "Title: ${repo} | ENDE: ${result} | ${GITHUB_WORKFLOW}" \
+            --data-binary "$message" \
+            https://ntfy.bot.omg.lol/doomsday-github-action
